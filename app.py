@@ -69,6 +69,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Inside the installed app (?embed=true) Streamlit hides its header, so drop the extra top gap
+if str(st.query_params.get("embed", "")).lower() == "true":
+    st.markdown(
+        "<style>.block-container{padding-top:1rem !important}</style>",
+        unsafe_allow_html=True,
+    )
+
 # --------------------------------------------------------------------------
 # Currency handling
 # --------------------------------------------------------------------------
@@ -457,8 +464,12 @@ with tab_ex:
     recent_tbl.index = recent_tbl.index.strftime("%d %b")  # short dates fit a phone screen
     st.dataframe(recent_tbl)
 
-    st.subheader("Correlation")
+    with st.expander("Summary statistics"):
+        st.dataframe(data.describe().round(2))
+
+    st.subheader("Correlation matrix")
     corr = data.corr()
+    st.dataframe(corr.style.format("{:.4f}"))
     fig, ax = plt.subplots(figsize=(FIG_W * 0.8, 3.6))
     sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", vmin=-1, vmax=1, ax=ax,
                 cbar=False, annot_kws={"size": 8})
@@ -503,7 +514,8 @@ with tab_ex:
                 "0.975]": result.conf_int()[1],
             }
         )
-        st.dataframe(coef_table.style.format("{:.6g}"))
+        st.dataframe(coef_table.style.format("{:.4g}"))
+        st.caption("Swipe the table sideways to see p-values and confidence intervals.")
 
         if result.condition_number > 1e6:
             st.warning(
@@ -534,6 +546,31 @@ with tab_ex:
             ax.hist(resid, bins=40, color=BLUE, edgecolor=BG)
             ax.set_xlabel("Residual")
             ax.set_title("Residual distribution")
+            show(fig)
+
+        st.subheader("Actual vs predicted")
+        unit = "" if target == "Volume" else f" ({CUR})"
+        a1, a2 = st.tabs(["Over time", "Scatter"])
+        with a1:
+            fig, ax = plt.subplots(figsize=(FIG_W, 3.4))
+            ax.plot(data.index, data[target], color=BLUE, lw=1.2, label="Actual")
+            ax.plot(fitted.index, fitted.values, color=ORANGE, lw=1.2, alpha=0.9, label="Predicted")
+            ax.set_ylabel(f"{target}{unit}")
+            ax.set_title(f"{target}: actual vs predicted")
+            ax.legend(loc="best", frameon=False)
+            ax.grid(alpha=0.3)
+            fix_dates(ax)
+            show(fig)
+        with a2:
+            fig, ax = plt.subplots(figsize=(FIG_W, 3.8))
+            ax.scatter(fitted, data[target], s=6, alpha=0.5, color=BLUE)
+            lo, hi = float(min(fitted.min(), data[target].min())), float(max(fitted.max(), data[target].max()))
+            ax.plot([lo, hi], [lo, hi], color=RED, lw=1, ls="--", label="Perfect prediction")
+            ax.set_xlabel(f"Predicted{unit}")
+            ax.set_ylabel(f"Actual{unit}")
+            ax.set_title("Actual vs predicted")
+            ax.legend(loc="best", frameon=False)
+            ax.grid(alpha=0.3)
             show(fig)
 
         st.caption(
