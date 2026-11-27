@@ -464,6 +464,62 @@ with tab_ex:
     recent_tbl.index = recent_tbl.index.strftime("%d %b")  # short dates fit a phone screen
     st.dataframe(recent_tbl)
 
+    # ---- CSV downloads: daily prices for a chosen year, or one row per year ----
+    st.markdown("**Download data (CSV)**")
+    dl_kind = st.radio(
+        "What to download",
+        ["Daily prices", "Yearly summary"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if dl_kind == "Daily prices":
+        years_available = sorted({d.year for d in data.index}, reverse=True)
+        year_pick = st.selectbox(
+            "Year",
+            ["All years"] + years_available,
+            format_func=str,
+            help="The years listed depend on the History you chose at the top of the page.",
+        )
+        sub = data if year_pick == "All years" else data[data.index.year == year_pick]
+        daily_csv = sub.round(4).copy()
+        daily_csv.insert(0, "Date", daily_csv.index.strftime("%Y-%m-%d"))
+        daily_csv["Currency"] = CUR
+        label_year = "all-years" if year_pick == "All years" else str(year_pick)
+        st.caption(
+            f"{len(sub):,} trading days · {sub.index.min():%d %b %Y} to {sub.index.max():%d %b %Y}"
+            + (" · year in progress" if year_pick == last_date.year else "")
+        )
+        st.download_button(
+            f"⬇️ Download {ticker} {label_year} (CSV)",
+            data=daily_csv.to_csv(index=False).encode("utf-8"),
+            file_name=f"{ticker}_{label_year}_daily.csv",
+            mime="text/csv",
+            type="primary",
+        )
+    else:
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+        agg = {c: f for c, f in agg.items() if c in data.columns}
+        yearly = data.groupby(data.index.year).agg(agg)
+        yearly["Trading days"] = data.groupby(data.index.year).size()
+        yearly["Change %"] = yearly["Close"].pct_change() * 100  # vs previous year's last close
+        yearly.index.name = "Year"
+        st.dataframe(yearly.round(2))
+        st.caption(
+            "One row per year: first open, highest high, lowest low, last close and total volume. "
+            "Change % compares each year's last close with the previous year's, so the first year is blank "
+            f"and {last_date.year} is year-to-date."
+        )
+        yearly_csv = yearly.round(4).reset_index()
+        yearly_csv["Currency"] = CUR
+        st.download_button(
+            f"⬇️ Download {ticker} yearly summary (CSV)",
+            data=yearly_csv.to_csv(index=False).encode("utf-8"),
+            file_name=f"{ticker}_yearly_summary.csv",
+            mime="text/csv",
+            type="primary",
+        )
+
     with st.expander("Summary statistics"):
         st.dataframe(data.describe().round(2))
 
