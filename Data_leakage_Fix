@@ -1,0 +1,381 @@
+--- a/app.py
++++ b/app.py
+@@ -9,6 +9,8 @@
+ import statsmodels.api as sm
+ import streamlit as st
+ import yfinance as yf
++from statsmodels.stats.stattools import durbin_watson
++from statsmodels.tsa.stattools import adfuller
+ 
+ warnings.filterwarnings("ignore")
+ 
+@@ -247,6 +249,81 @@
+ 
+ 
+ # --------------------------------------------------------------------------
++# Custom OLS helpers — no look-ahead: every predictor is strictly older than the target
++# --------------------------------------------------------------------------
++TARGETS = {"return": "Next-day return (%)", "close": "Next-day Close"}
++MODEL_FEATURES = ["Return", "Volume change", "Close", "High", "Low", "Open", "Volume"]
++FEATURE_LABELS = {
++    "Return": "Return (%)",
++    "Volume change": "Volume change (%)",
++    "Close": "Close",
++    "High": "High",
++    "Low": "Low",
++    "Open": "Open",
++    "Volume": "Volume (millions)",
++}
++LAG_CHOICES = [1, 2, 3, 5]
++TRAIN_FRACTION = 0.8
++
++
++def build_model_frame(df: pd.DataFrame, features: list, n_lags: int, target_kind: str) -> pd.DataFrame:
++    """Modelling table. Row t is a trading day we want to forecast; the model only sees data up to
++    the close of day t-1, because every predictor is shifted back by at least one day.
++
++    Columns: 'target' (what happens on day t), 'naive' (the baseline forecast for day t) and one
++    '<feature>_lag<k>' column per feature and lag k = 1..n_lags. No same-day predictor exists.
++    """
++    if n_lags < 1:
++        raise ValueError("Predictors must be lagged by at least one day.")
++    close = df["Close"]
++    vol = df["Volume"].astype(float)
++    base = {
++        "Close": close,
++        "High": df["High"],
++        "Low": df["Low"],
++        "Open": df["Open"],
++        "Volume": vol / 1e6,  # millions: keeps the design matrix well scaled
++        "Return": close.pct_change() * 100,
++        "Volume change": vol.pct_change().replace([np.inf, -np.inf], np.nan) * 100,
++    }
++    lagged = {f"{name}_lag{k}": base[name].shift(k) for name in features for k in range(1, n_lags + 1)}
++    if target_kind == "close":
++        target = close  # next day's Close, relative to the last day the model has seen
++        naive = close.shift(1)  # "tomorrow = today"
++    else:
++        target = close.pct_change() * 100  # next day's return (%)
++        naive = pd.Series(0.0, index=df.index)  # "no change"
++    frame = pd.DataFrame({"target": target, "naive": naive, **lagged}, index=df.index)
++    return frame.replace([np.inf, -np.inf], np.nan).dropna()
++
++
++def regression_metrics(y_true: pd.Series, y_pred: pd.Series) -> dict:
++    err = y_true - y_pred
++    sse = float((err**2).sum())
++    sst = float(((y_true - y_true.mean()) ** 2).sum())
++    return {
++        "r2": 1 - sse / sst if sst > 0 else float("nan"),
++        "rmse": float(np.sqrt((err**2).mean())),
++        "mae": float(err.abs().mean()),
++    }
++
++
++def adf_pvalue(series: pd.Series):
++    """Augmented Dickey-Fuller p-value (small = stationary). None if the test cannot run."""
++    try:
++        return float(adfuller(series.dropna(), autolag="AIC")[1])
++    except Exception:
++        return None
++
++
++def standardized_condition_number(X: pd.DataFrame) -> float:
++    """Scale-free multicollinearity measure: condition number of the z-scored predictors."""
++    std = X.std(ddof=0).replace(0, np.nan)
++    Z = ((X - X.mean()) / std).dropna(axis=1, how="any")  # constant columns drop out
++    return float(np.linalg.cond(Z.to_numpy())) if Z.shape[1] >= 2 else 1.0
++
++
++# --------------------------------------------------------------------------
+ # Header + controls (in the main page: the sidebar is easy to miss on phones)
+ # --------------------------------------------------------------------------
+ st.title("📈 Stock Price Prediction")
+@@ -532,33 +609,166 @@
+     show(fig)
+ 
+     st.subheader("Custom OLS regression")
+-    target = st.selectbox("Dependent variable (y)", PRICE_COLS, index=3)
+-    default_x = [c for c in ["Open", "Volume"] if c != target]
++    st.info(
++        "**Why a price-level regression shows R² ≈ 0.999, and why this one doesn't**\n\n"
++        "- **Leakage:** a day's Open, High and Low are almost the same number as its Close, so using them "
++        "to \"predict\" Close just copies the answer.\n"
++        "- **Non-stationarity:** prices drift upward or downward, and any two drifting series look related "
++        "(*spurious regression*). That inflates R² and makes the coefficients meaningless.\n"
++        "- **What this model does instead:** it only uses data up to the *previous* close to predict the next "
++        "day, is fitted on the first 80% of dates and is scored on the last 20%, which it never saw.\n"
++        "- **A low R² on returns is normal.** Daily returns are close to random, so an out-of-sample R² near "
++        "zero (even slightly negative) is what an honest model looks like. Judge it against the baseline "
++        "below, not against 0.999."
++    )
++
++    target_kind = st.selectbox("Dependent variable (y)", list(TARGETS), index=0, format_func=TARGETS.get)
++    default_x = ["Return", "Volume change"] if target_kind == "return" else ["Close", "Return", "Volume change"]
+     features = st.multiselect(
+-        "Independent variables (X)",
+-        [c for c in PRICE_COLS if c != target],
++        "Independent variables (X), lagged",
++        MODEL_FEATURES,
+         default=default_x,
++        format_func=FEATURE_LABELS.get,
++        key=f"ols_features_{target_kind}",
++        help="Every predictor is shifted back by at least one day, so the model never sees the day it predicts.",
++    )
++    n_lags = st.selectbox(
++        "Days of history per predictor",
++        LAG_CHOICES,
++        format_func=lambda n: "Yesterday only" if n == 1 else f"Last {n} days",
+     )
+ 
+-    if len(features) >= 1 and st.checkbox("Show pair plot (slower)", value=False):
+-        g = sns.pairplot(
+-            data[[target] + features],
+-            kind="reg",
+-            height=2.0,
+-            plot_kws={"line_kws": {"color": RED}, "scatter_kws": {"s": 6, "alpha": 0.5}},
+-        )
+-        show(g.figure)
+-
++    ready = False
+     if not features:
+         st.warning("Select at least one independent variable.")
+     else:
+-        result = sm.OLS(data[target], sm.add_constant(data[features])).fit()
++        frame = build_model_frame(data, features, n_lags, target_kind)
++        feature_cols = [c for c in frame.columns if c not in ("target", "naive")]
++        split = int(len(frame) * TRAIN_FRACTION)  # chronological: first 80% train, last 20% test
++        train, test = frame.iloc[:split], frame.iloc[split:]
++        ready = len(train) >= len(feature_cols) + 30 and len(test) >= 20
++        if not ready:
++            st.warning(
++                "Not enough rows after lagging. Choose fewer predictors or lags, or a longer History at the top."
++            )
++
++    if ready:
++        if st.checkbox("Show pair plot (slower)", value=False):
++            pair_cols = [c for c in feature_cols if c.endswith("_lag1")][:4]
++            pair_df = frame[["target"] + pair_cols].rename(columns={"target": TARGETS[target_kind]})
++            g = sns.pairplot(
++                pair_df,
++                kind="reg",
++                height=2.0,
++                plot_kws={"line_kws": {"color": RED}, "scatter_kws": {"s": 6, "alpha": 0.5}},
++            )
++            show(g.figure)
++            st.caption("The target against each predictor's 1-day lag (first four predictors).")
++
++        # ---- fit on the training period only, score on the unseen test period ----
++        y_name = "next_day_return_pct" if target_kind == "return" else "next_day_close"
++        result = sm.OLS(train["target"].rename(y_name), sm.add_constant(train[feature_cols])).fit()
++        pred_test = result.predict(sm.add_constant(test[feature_cols], has_constant="add"))
++        resid_test = test["target"] - pred_test
++        m_test = regression_metrics(test["target"], pred_test)
++        m_base = regression_metrics(test["target"], test["naive"])
++
++        if target_kind == "close":
++            err = lambda v: money(v, CUR)  # noqa: E731
++            base_label = "Baseline: tomorrow = today"
++            y_label = f"Close ({CUR})"
++        else:
++            err = lambda v: f"{v:.3f}%"  # noqa: E731
++            base_label = "Baseline: 0% return"
++            y_label = "Daily return (%)"
++
++        st.caption(
++            f"Train: {train.index.min():%d %b %Y} to {train.index.max():%d %b %Y} ({len(train):,} days) · "
++            f"Test: {test.index.min():%d %b %Y} to {test.index.max():%d %b %Y} ({len(test):,} days). "
++            "Chronological split, no shuffling; the model is fitted on the training days only."
++        )
+ 
+         r1, r2, r3, r4 = st.columns(4)
+-        r1.metric("R²", f"{result.rsquared:.4f}")
+-        r2.metric("Adj. R²", f"{result.rsquared_adj:.4f}")
+-        r3.metric("F-statistic", f"{result.fvalue:,.1f}")
+-        r4.metric("Observations", f"{int(result.nobs):,}")
++        r1.metric("Train R²", f"{result.rsquared:.4f}")
++        r2.metric("Test R²", f"{m_test['r2']:.4f}")
++        r3.metric("Test RMSE", err(m_test["rmse"]))
++        r4.metric("Test MAE", err(m_test["mae"]))
++
++        q1, q2, q3, q4 = st.columns(4)
++        q1.metric("Adj. R² (train)", f"{result.rsquared_adj:.4f}")
++        q2.metric("F-statistic (train)", f"{result.fvalue:,.1f}")
++        q3.metric("Train days", f"{int(result.nobs):,}")
++        q4.metric("Test days", f"{len(test):,}")
++
++        # ---- baseline comparison ----
++        st.markdown("**Model vs naive baseline (test)**")
++        st.dataframe(
++            pd.DataFrame(
++                {
++                    "RMSE": [err(m_test["rmse"]), err(m_base["rmse"])],
++                    "MAE": [err(m_test["mae"]), err(m_base["mae"])],
++                },
++                index=["Model", base_label],
++            )
++        )
++        gain_rmse = (m_base["rmse"] - m_test["rmse"]) / m_base["rmse"] * 100
++        gain_mae = (m_base["mae"] - m_test["mae"]) / m_base["mae"] * 100
++        if gain_rmse > 0 and gain_mae > 0:
++            st.success(
++                f"The model beats the baseline on the test period: RMSE {gain_rmse:.1f}% lower and "
++                f"MAE {gain_mae:.1f}% lower."
++            )
++        elif gain_rmse <= 0 and gain_mae <= 0:
++            st.warning(
++                f"The model does **not** beat the baseline (RMSE {abs(gain_rmse):.1f}% higher, "
++                f"MAE {abs(gain_mae):.1f}% higher). It adds nothing over simply assuming "
++                f"{'tomorrow equals today' if target_kind == 'close' else 'a 0% return'}."
++            )
++        else:
++            st.info(
++                f"Mixed result: RMSE is {abs(gain_rmse):.1f}% {'lower' if gain_rmse > 0 else 'higher'} and MAE is "
++                f"{abs(gain_mae):.1f}% {'lower' if gain_mae > 0 else 'higher'} than the baseline, "
++                "so there is no clear advantage."
++            )
++        st.caption("One test window can flatter or punish a model, so treat small differences as noise.")
++
++        # ---- diagnostics ----
++        st.markdown("**Diagnostics**")
++        dw = float(durbin_watson(result.resid))
++        adf_p = adf_pvalue(train["target"])
++        g1, g2 = st.columns(2)
++        g1.metric("Durbin-Watson", f"{dw:.2f}", help="Residual autocorrelation. About 2 = none; below 1.5 = positive; above 2.5 = negative.")
++        g2.metric(
++            "ADF p-value (target)",
++            "n/a" if adf_p is None else f"{adf_p:.3f}",
++            help="Augmented Dickey-Fuller test on the training target. Below 0.05 = the series looks stationary.",
++        )
++        non_stationary = adf_p is not None and adf_p > 0.05
++        autocorrelated = dw < 1.5 or dw > 2.5
++        if non_stationary:
++            st.warning(
++                f"The target looks **non-stationary** (ADF p = {adf_p:.2f}, above 0.05). R² and coefficients on "
++                "trending levels can be inflated or spurious. Use next-day returns instead."
++            )
++        if autocorrelated:
++            st.warning(
++                f"The residuals look **autocorrelated** (Durbin-Watson = {dw:.2f}; about 2 is healthy). "
++                "Standard errors and p-values may be unreliable."
++            )
++        if not non_stationary and not autocorrelated:
++            st.caption(
++                f"Diagnostics look fine: the target looks stationary (ADF p = "
++                f"{'n/a' if adf_p is None else f'{adf_p:.3f}'}) and the residuals show no strong autocorrelation "
++                f"(Durbin-Watson = {dw:.2f})."
++            )
++
++        cond = standardized_condition_number(train[feature_cols])
++        if cond > 30:
++            st.warning(
++                f"Possible multicollinearity: the condition number of the standardised predictors is {cond:,.0f} "
++                "(above about 30 is a concern). A common cause is Close, High, Low and Open being almost the same "
++                "number, which makes their lags interchangeable. Keep just one of them, or use returns."
++            )
+ 
+         coef_table = pd.DataFrame(
+             {
+@@ -571,68 +781,74 @@
+             }
+         )
+         st.dataframe(coef_table.style.format("{:.4g}"))
+-        st.caption("Swipe the table sideways to see p-values and confidence intervals.")
+-
+-        if result.condition_number > 1e6:
+-            st.warning(
+-                f"Condition number is large ({result.condition_number:.2e}), which may indicate "
+-                "multicollinearity or scaling problems (e.g. Volume vs. price)."
+-            )
++        st.caption("Coefficients come from the training period. Swipe the table sideways to see p-values and confidence intervals.")
+ 
+         with st.expander("Full statsmodels summary"):
+             st.code(result.summary().as_text(), language="text")
+ 
++        # ---- residual plots ----
+         fitted, resid = result.fittedvalues, result.resid
+-        d1, d2, d3 = st.tabs(["Residuals", "Q-Q plot", "Histogram"])
++        d1, d2, d3, d4 = st.tabs(["Residuals", "Over time", "Q-Q plot", "Histogram"])
+         with d1:
+             fig, ax = plt.subplots(figsize=(FIG_W, 3.4))
+             ax.scatter(fitted, resid, s=6, alpha=0.5, color=BLUE)
+             ax.axhline(0, color=FG, lw=0.8)
+             ax.set_xlabel("Fitted values")
+             ax.set_ylabel("Residuals")
+-            ax.set_title("Residuals vs fitted")
++            ax.set_title("Residuals vs fitted (training)")
+             show(fig)
+         with d2:
+             fig, ax = plt.subplots(figsize=(FIG_W, 3.4))
+-            sm.qqplot(resid, line="s", ax=ax, markersize=3)
+-            ax.set_title("Normal Q-Q")
++            ax.plot(resid.index, resid.values, color=BLUE, lw=0.8, label="Train")
++            ax.plot(resid_test.index, resid_test.values, color=ORANGE, lw=0.8, label="Test")
++            ax.axhline(0, color=FG, lw=0.8)
++            ax.axvline(test.index[0], color=RED, ls="--", lw=1)
++            ax.set_ylabel("Residuals")
++            ax.set_title("Residuals over time")
++            ax.legend(loc="best", frameon=False)
++            ax.grid(alpha=0.3)
++            fix_dates(ax)
+             show(fig)
++            st.caption("Runs of same-sign residuals mean autocorrelation. The dashed line is where the test period starts.")
+         with d3:
+             fig, ax = plt.subplots(figsize=(FIG_W, 3.4))
++            sm.qqplot(resid, line="s", ax=ax, markersize=3)
++            ax.set_title("Normal Q-Q (training)")
++            show(fig)
++        with d4:
++            fig, ax = plt.subplots(figsize=(FIG_W, 3.4))
+             ax.hist(resid, bins=40, color=BLUE, edgecolor=BG)
+             ax.set_xlabel("Residual")
+-            ax.set_title("Residual distribution")
++            ax.set_title("Residual distribution (training)")
+             show(fig)
+ 
+-        st.subheader("Actual vs predicted")
+-        unit = "" if target == "Volume" else f" ({CUR})"
++        # ---- actual vs predicted, on the unseen test period ----
++        st.subheader("Actual vs predicted (test period)")
+         a1, a2 = st.tabs(["Over time", "Scatter"])
+         with a1:
+             fig, ax = plt.subplots(figsize=(FIG_W, 3.4))
+-            ax.plot(data.index, data[target], color=BLUE, lw=1.2, label="Actual")
+-            ax.plot(fitted.index, fitted.values, color=ORANGE, lw=1.2, alpha=0.9, label="Predicted")
+-            ax.set_ylabel(f"{target}{unit}")
+-            ax.set_title(f"{target}: actual vs predicted")
++            ax.plot(test.index, test["target"], color=BLUE, lw=1.0, label="Actual")
++            ax.plot(pred_test.index, pred_test.values, color=ORANGE, lw=1.2, alpha=0.9, label="Model")
++            ax.plot(test.index, test["naive"], color=FG, lw=0.9, ls="--", alpha=0.6, label=base_label.replace("Baseline: ", "Baseline "))
++            ax.set_ylabel(y_label)
++            ax.set_title("Actual vs predicted")
+             ax.legend(loc="best", frameon=False)
+             ax.grid(alpha=0.3)
+             fix_dates(ax)
+             show(fig)
+         with a2:
+             fig, ax = plt.subplots(figsize=(FIG_W, 3.8))
+-            ax.scatter(fitted, data[target], s=6, alpha=0.5, color=BLUE)
+-            lo, hi = float(min(fitted.min(), data[target].min())), float(max(fitted.max(), data[target].max()))
++            ax.scatter(pred_test, test["target"], s=8, alpha=0.5, color=BLUE)
++            lo = float(min(pred_test.min(), test["target"].min()))
++            hi = float(max(pred_test.max(), test["target"].max()))
+             ax.plot([lo, hi], [lo, hi], color=RED, lw=1, ls="--", label="Perfect prediction")
+-            ax.set_xlabel(f"Predicted{unit}")
+-            ax.set_ylabel(f"Actual{unit}")
+-            ax.set_title("Actual vs predicted")
++            ax.set_xlabel(f"Predicted ({y_label})")
++            ax.set_ylabel(f"Actual ({y_label})")
++            ax.set_title("Actual vs predicted (test)")
+             ax.legend(loc="best", frameon=False)
+             ax.grid(alpha=0.3)
+             show(fig)
+-
+-        st.caption(
+-            "Note: regressing Close on same-day Open gives a very high R² simply because prices "
+-            "on the same day are close together. It cannot be used to forecast tomorrow."
+-        )
++        st.caption("Train metrics describe the past. The test metrics and the baseline comparison are the honest score.")
+ 
+ st.divider()
+ st.caption("Data: Yahoo Finance via yfinance · Built with Streamlit and statsmodels.")
